@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 import timeit
 import argparse
-
+from contextlib import nullcontext
 
 def random_batch(batch_size: int, context_length: int, vocab_size: int) -> tuple[Tensor, Tensor]:
     xb = torch.randint(low=0, high=vocab_size, size=(batch_size, context_length), device=torch.device("cuda"))
@@ -19,40 +19,56 @@ def benchmark(
     batch_size: int,
     context_length: int,
     vocab_size: int,
+    amp: bool,
+    mem_prof: bool,
 ):
     model.train()
     xb, yb = random_batch(batch_size, context_length, vocab_size)
+    amp_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if amp
+        else nullcontext()
+    )
+    scaler = torch.amp.GradScaler(device="cuda", enabled=amp)
+
     for _ in range(warmup_iter):
-        logits = model(xb)
-        loss = cross_entropy(logits, yb)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        with amp_ctx:
+            logits = model(xb)
+            loss = cross_entropy(logits, yb)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
     torch.cuda.synchronize()
 
+    if mem_prof:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     forward_time = 0
     backward_time = 0
     for _ in range(prof_iter):
-        forward_start = timeit.default_timer()
-        logits = model(xb)
-        torch.cuda.synchronize()
-        forward_end = timeit.default_timer()
-        forward_time += forward_end - forward_start
-
-        loss = cross_entropy(logits, yb)
         optimizer.zero_grad(set_to_none=True)
+        forward_start = timeit.default_timer()
+        with amp_ctx:
+            logits = model(xb)
+            loss = cross_entropy(logits, yb)
+        torch.cuda.synchronize()
+        forward_time += timeit.default_timer() - forward_start
 
         backward_start = timeit.default_timer()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         torch.cuda.synchronize()
-        backward_end = timeit.default_timer()
-        backward_time += backward_end - backward_start
+        backward_time += timeit.default_timer() - backward_start
 
     forward_time /= prof_iter
     backward_time /= prof_iter
     print(f"Forward elapsed time: {forward_time:.6f}")
     print(f"Backward elapsed time: {backward_time:.6f}")
+
+    if mem_prof:
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def main():
@@ -66,6 +82,8 @@ def main():
     parser.add_argument("--warmup_iter", type=int, default=5)
     parser.add_argument("--prof_iter", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--amp", action="store_true", help="Enable BF16 mixed precision")
+    parser.add_argument("--mem_prof", action="store_true", help="Enable memory profiling")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -90,6 +108,8 @@ def main():
         batch_size=args.batch_size,
         context_length=args.context_length,
         vocab_size=args.vocab_size,
+        amp=args.amp,
+        mem_prof=args.mem_prof
     )
 
 
