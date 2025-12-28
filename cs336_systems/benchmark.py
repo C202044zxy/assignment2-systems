@@ -20,27 +20,19 @@ def benchmark(
     context_length: int,
     vocab_size: int,
 ):
-    # Clear GPU cache before starting
-    torch.cuda.empty_cache()
-    
+    model.train()
+    xb, yb = random_batch(batch_size, context_length, vocab_size)
     for _ in range(warmup_iter):
-        xb, yb = random_batch(batch_size, context_length, vocab_size)
         logits = model(xb)
         loss = cross_entropy(logits, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        # Explicitly delete intermediate tensors to free memory
-        del logits, loss, xb, yb
-
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()  # Clear cache after warmup
-    
+
     forward_time = 0
     backward_time = 0
     for _ in range(prof_iter):
-        xb, yb = random_batch(batch_size, context_length, vocab_size)
-
         forward_start = timeit.default_timer()
         logits = model(xb)
         torch.cuda.synchronize()
@@ -56,9 +48,6 @@ def benchmark(
         torch.cuda.synchronize()
         backward_end = timeit.default_timer()
         backward_time += backward_end - backward_start
-        
-        # Clean up intermediate tensors
-        del logits, loss, xb, yb
 
     forward_time /= prof_iter
     backward_time /= prof_iter
@@ -69,11 +58,11 @@ def benchmark(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--vocab_size", type=int, default=10000)
-    parser.add_argument("--context_length", type=int, default=64)
-    parser.add_argument("--d_model", type=int, default=512)
-    parser.add_argument("--d_ff", type=int, default=1344)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--context_length", type=int, default=128)
+    parser.add_argument("--d_model", type=int, default=768)
+    parser.add_argument("--d_ff", type=int, default=3072)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--warmup_iter", type=int, default=5)
     parser.add_argument("--prof_iter", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -81,13 +70,27 @@ def main():
 
     device = torch.device("cuda")
     model = BasicsTransformerLM(
-        args.vocab_size, args.context_length, args.d_model, args.d_ff, args.num_layers, args.num_heads, 10000.0
+        vocab_size=args.vocab_size,
+        context_length=args.context_length,
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        d_ff=args.d_ff,
+        rope_theta=10000.0,
     )
     model.to(device)
     optimizer = AdamW(model.parameters())
     print("model and optimizer initialized")
 
-    benchmark(model, optimizer, args.warmup_iter, args.prof_iter, args.batch_size, args.context_length, args.vocab_size)
+    benchmark(
+        model=model,
+        optimizer=optimizer,
+        warmup_iter=args.warmup_iter,
+        prof_iter=args.prof_iter,
+        batch_size=args.batch_size,
+        context_length=args.context_length,
+        vocab_size=args.vocab_size,
+    )
 
 
 if __name__ == "__main__":
