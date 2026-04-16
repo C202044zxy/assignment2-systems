@@ -13,6 +13,10 @@ from tests.common import (
     validate_ddp_net_equivalence,
 )
 from copy import deepcopy
+from torch._utils import (
+    _flatten_dense_tensors,
+    _unflatten_dense_tensors,
+)
 
 
 def ddp_train(rank: int, world_size: int, model: nn.Module):
@@ -48,10 +52,19 @@ def ddp_train(rank: int, world_size: int, model: nn.Module):
         shard_outputs = ddp_model(shard_x)
         shard_loss = loss_fn(shard_outputs, shard_y)
         shard_loss.backward()
-        for param in ddp_model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
-                param.grad /= world_size
+
+        shard_grads = [p.grad for p in ddp_model.parameters() if p.grad is not None]
+        flat = _flatten_dense_tensors(shard_grads)
+        dist.all_reduce(flat)
+        flat /= world_size
+        reduced_grads = _unflatten_dense_tensors(flat, shard_grads)
+        with torch.no_grad():
+            for param, grad in zip(
+                [p for p in ddp_model.parameters() if p.grad is not None],
+                reduced_grads
+            ):
+                param.grad.copy_(grad)
+
         ddp_optimizer.step()
 
         for param, ddp_param in zip(reference_model.parameters(), ddp_model.parameters()):
